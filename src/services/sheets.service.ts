@@ -19,24 +19,35 @@ const HEADERS = [
 ];
 
 function getAuth(): GoogleAuth | UserRefreshClient {
-  // Option 1: JSON string in env — supports both service_account and authorized_user
-  if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
-    const json = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON) as Record<string, string>;
-    // authorized_user type (from scripts/google-auth.js)
-    if (json.type === 'authorized_user') {
-      const client = new UserRefreshClient({
-        clientId:     json.client_id,
-        clientSecret: json.client_secret,
-        refreshToken: json.refresh_token,
-      });
-      return client;
-    }
-    // service_account type
-    return new GoogleAuth({ credentials: json, scopes: SCOPES });
+  // Option 1: Individual OAuth2 env vars (cloud-safe, no JSON escaping issues)
+  if (process.env.GOOGLE_OAUTH_REFRESH_TOKEN) {
+    return new UserRefreshClient({
+      clientId:     process.env.GOOGLE_OAUTH_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_OAUTH_CLIENT_SECRET,
+      refreshToken: process.env.GOOGLE_OAUTH_REFRESH_TOKEN,
+    });
   }
 
-  // Option 2: Key file path (service account OR authorized_user)
-  const keyFile = process.env.GOOGLE_SERVICE_ACCOUNT_KEY_PATH;
+  // Option 2: JSON string (service_account or authorized_user)
+  if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+    try {
+      const json = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON) as Record<string, string>;
+      if (json.type === 'authorized_user') {
+        return new UserRefreshClient({
+          clientId:     json.client_id,
+          clientSecret: json.client_secret,
+          refreshToken: json.refresh_token,
+        });
+      }
+      return new GoogleAuth({ credentials: json, scopes: SCOPES });
+    } catch (e) {
+      logger.warn('GOOGLE_SERVICE_ACCOUNT_JSON parse failed', e);
+    }
+  }
+
+  // Option 3: Key file path
+  const keyFile = process.env.GOOGLE_SERVICE_ACCOUNT_KEY_PATH
+    || process.env.GOOGLE_APPLICATION_CREDENTIALS;
   if (keyFile) {
     try {
       fs.accessSync(path.resolve(keyFile));
@@ -44,13 +55,7 @@ function getAuth(): GoogleAuth | UserRefreshClient {
     } catch { /* fall through */ }
   }
 
-  // Option 3: GOOGLE_APPLICATION_CREDENTIALS (local dev with google-oauth2.json)
-  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-    const credPath = path.resolve(process.env.GOOGLE_APPLICATION_CREDENTIALS);
-    return new GoogleAuth({ keyFile: credPath, scopes: SCOPES });
-  }
-
-  throw new Error('Google credentials not configured. Set GOOGLE_SERVICE_ACCOUNT_JSON in env.');
+  throw new Error('Google credentials not configured. Set GOOGLE_OAUTH_REFRESH_TOKEN in env.');
 }
 
 function getConfig(): { spreadsheetId: string; sheetName: string } {
