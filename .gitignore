@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+credentials/
+*.log
+.DS_Store
+tunnel_url.txt
+client_secret*.json
