@@ -1,5 +1,5 @@
 import { google } from 'googleapis';
-import { GoogleAuth } from 'google-auth-library';
+import { GoogleAuth, UserRefreshClient } from 'google-auth-library';
 import path from 'path';
 import fs from 'fs';
 import { SheetRow } from '../types';
@@ -18,34 +18,39 @@ const HEADERS = [
   'Recorded At',
 ];
 
-function getAuth(): GoogleAuth {
-  // Option 1: Service account JSON string (cloud deployments)
+function getAuth(): GoogleAuth | UserRefreshClient {
+  // Option 1: JSON string in env — supports both service_account and authorized_user
   if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
-    const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON) as object;
-    return new GoogleAuth({ credentials, scopes: SCOPES });
+    const json = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON) as Record<string, string>;
+    // authorized_user type (from scripts/google-auth.js)
+    if (json.type === 'authorized_user') {
+      const client = new UserRefreshClient({
+        clientId:     json.client_id,
+        clientSecret: json.client_secret,
+        refreshToken: json.refresh_token,
+      });
+      return client;
+    }
+    // service_account type
+    return new GoogleAuth({ credentials: json, scopes: SCOPES });
   }
 
-  // Option 2: Explicit key file path (service account OR authorized_user JSON)
+  // Option 2: Key file path (service account OR authorized_user)
   const keyFile = process.env.GOOGLE_SERVICE_ACCOUNT_KEY_PATH;
   if (keyFile) {
     try {
       fs.accessSync(path.resolve(keyFile));
       return new GoogleAuth({ keyFile: path.resolve(keyFile), scopes: SCOPES });
-    } catch {
-      // File doesn't exist — fall through
-    }
+    } catch { /* fall through */ }
   }
 
-  // Option 3: GOOGLE_APPLICATION_CREDENTIALS env var (authorized_user / ADC)
-  // GoogleAuth auto-reads this env var — works with google-oauth2.json from scripts/google-auth.js
+  // Option 3: GOOGLE_APPLICATION_CREDENTIALS (local dev with google-oauth2.json)
   if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
     const credPath = path.resolve(process.env.GOOGLE_APPLICATION_CREDENTIALS);
     return new GoogleAuth({ keyFile: credPath, scopes: SCOPES });
   }
 
-  throw new Error(
-    'Google credentials not configured. Set GOOGLE_APPLICATION_CREDENTIALS=./credentials/google-oauth2.json'
-  );
+  throw new Error('Google credentials not configured. Set GOOGLE_SERVICE_ACCOUNT_JSON in env.');
 }
 
 function getConfig(): { spreadsheetId: string; sheetName: string } {
@@ -56,7 +61,10 @@ function getConfig(): { spreadsheetId: string; sheetName: string } {
 
 async function getSheetsClient() {
   const auth = getAuth();
-  const authClient = await auth.getClient();
+  // UserRefreshClient ใช้โดยตรงได้เลย, GoogleAuth ต้อง getClient() ก่อน
+  const authClient = auth instanceof UserRefreshClient
+    ? auth
+    : await (auth as GoogleAuth).getClient();
   return google.sheets({ version: 'v4', auth: authClient as Parameters<typeof google.sheets>[0]['auth'] });
 }
 
