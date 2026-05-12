@@ -2,24 +2,47 @@ import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
 import type { WebhookRequestBody, WebhookEvent } from '@line/bot-sdk';
 import type { PendingReceipt, SheetRow } from '../types';
+import { DEPARTMENTS } from '../types';
 import {
   downloadLineImage,
   replyText,
   replyFlexTourGroupSelector,
   pushConfirmation,
+  replyAskName,
+  replyAskDepartment,
+  replyRegistrationComplete,
+  replyFlex,
 } from '../services/line.service';
 import { extractReceiptData } from '../services/vision.service';
-import { appendReceiptRow } from '../services/sheets.service';
+import {
+  appendReceiptRow,
+  getMonthSummary,
+  getUserRecentExpenses,
+} from '../services/sheets.service';
+import {
+  isRegistered,
+  getUser,
+  getUserDisplayName,
+  getUserDepartment,
+  registerUser,
+  startRegistration,
+  getPendingRegistration,
+  advanceRegistration,
+} from '../services/user.service';
+import {
+  buildMonthlySummaryFlex,
+  buildMyExpensesFlex,
+  buildHelpText,
+} from '../services/report.service';
 import { logger } from '../utils/logger';
 
 const router = Router();
 
 // ─── In-memory pending store (userId → receipt awaiting tour group) ────────────
-// For production, swap with Redis: SET key JSON.stringify(pending) EX 1800
 const pendingReceipts = new Map<string, PendingReceipt>();
 
 setInterval(() => {
-  const ttl = 30 * 60 * 1000; // 30 minutes
+  const ttl = 30 * 60 * 1000;
   const now = Date.now();
   for (const [key, val] of pendingReceipts) {
     if (now - val.createdAt > ttl) pendingReceipts.delete(key);
@@ -33,11 +56,106 @@ function verifySignature(rawBody: string, signature: string): boolean {
     .createHmac('sha256', process.env.LINE_CHANNEL_SECRET!)
     .update(rawBody)
     .digest('base64');
-  // Constant-time comparison to prevent timing attacks
   return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
 }
 
-// ─── Event Handlers ────────────────────────────────────────────────────────────
+// ─── Event: Follow ─────────────────────────────────────────────────────────────
+
+async function handleFollowEvent(event: WebhookEvent): Promise<void> {
+  if (event.type !== 'follow') return;
+  const userId = event.source.userId ?? 'unknown';
+  const { replyToken } = event;
+
+  if (!isRegistered(userId)) {
+    startRegistration(userId);
+    await replyAskName(replyToken);
+  } else {
+    await replyText(replyToken, `ยินดีต้อนรับกลับมา ${getUserDisplayName(userId)}! 👋\nพิมพ์ /help เพื่อดูเมนู`);
+  }
+}
+
+// ─── Event: Text Message ───────────────────────────────────────────────────────
+
+async function handleTextMessage(event: WebhookEvent): Promise<void> {
+  if (event.type !== 'message' || event.message.type !== 'text') return;
+
+  const userId = event.source.userId ?? 'unknown';
+  const { replyToken } = event;
+  const text = event.message.text.trim();
+
+  // ── Registration flow ──
+  const pendingReg = getPendingRegistration(userId);
+  if (pendingReg) {
+    if (pendingReg.step === 'awaiting_name') {
+      if (text.length < 2) {
+        await replyText(replyToken, 'กรุณาพิมพ์ชื่อ-นามสกุลของคุณ (อย่างน้อย 2 ตัวอักษร)');
+        return;
+      }
+      advanceRegistration(userId, text);
+      await replyAskDepartment(replyToken, text);
+      return;
+    }
+
+    if (pendingReg.step === 'awaiting_department') {
+      const dept = (DEPARTMENTS as readonly string[]).includes(text) ? text : 'ทั่วไป';
+      const displayName = pendingReg.displayName ?? text;
+      registerUser(userId, displayName, dept);
+      await replyRegistrationComplete(replyToken, displayName, dept);
+      return;
+    }
+  }
+
+  // ── Prompt unregistered users ──
+  if (!isRegistered(userId)) {
+    startRegistration(userId);
+    await replyAskName(replyToken);
+    return;
+  }
+
+  // ── Commands ──
+  const cmd = text.toLowerCase();
+
+  if (cmd === '/report' || cmd === 'รายงาน') {
+    try {
+      const summary = await getMonthSummary();
+      const flex = buildMonthlySummaryFlex(summary);
+      await replyFlex(replyToken, `รายงานค่าใช้จ่าย ${summary.month}`, flex);
+    } catch {
+      await replyText(replyToken, 'ขออภัย ไม่สามารถดึงข้อมูลได้ในขณะนี้');
+    }
+    return;
+  }
+
+  if (cmd === '/my' || cmd === 'รายการของฉัน') {
+    try {
+      const displayName = getUserDisplayName(userId);
+      const rows = await getUserRecentExpenses(displayName, 10);
+      const flex = buildMyExpensesFlex(rows, displayName);
+      await replyFlex(replyToken, `รายการของ ${displayName}`, flex);
+    } catch {
+      await replyText(replyToken, 'ขออภัย ไม่สามารถดึงข้อมูลได้ในขณะนี้');
+    }
+    return;
+  }
+
+  if (cmd === '/help' || cmd === 'ช่วยเหลือ' || cmd === 'help') {
+    await replyText(replyToken, buildHelpText());
+    return;
+  }
+
+  if (cmd === '/budget' || cmd === 'งบประมาณ') {
+    await replyText(
+      replyToken,
+      '💰 ระบบงบประมาณอยู่ระหว่างพัฒนา\nใช้คำสั่ง /report เพื่อดูยอดค่าใช้จ่ายปัจจุบัน'
+    );
+    return;
+  }
+
+  // ── Default: show help ──
+  await replyText(replyToken, buildHelpText());
+}
+
+// ─── Event: Image Message ──────────────────────────────────────────────────────
 
 async function handleImageMessage(event: WebhookEvent): Promise<void> {
   if (event.type !== 'message' || event.message.type !== 'image') return;
@@ -45,6 +163,13 @@ async function handleImageMessage(event: WebhookEvent): Promise<void> {
   const messageId = event.message.id;
   const userId = event.source.userId ?? 'unknown';
   const { replyToken } = event;
+
+  // Prompt unregistered users to register first
+  if (!isRegistered(userId)) {
+    startRegistration(userId);
+    await replyAskName(replyToken);
+    return;
+  }
 
   logger.info('Image message received', { messageId, userId });
 
@@ -54,19 +179,17 @@ async function handleImageMessage(event: WebhookEvent): Promise<void> {
   if (receipt.error) {
     await replyText(
       replyToken,
-      `ไม่สามารถอ่านเอกสารได้\n\nกรุณาส่งภาพใบเสร็จ, สลิปโอนเงิน หรือบิลค่าใช้จ่ายเท่านั้น`
+      'ไม่สามารถอ่านเอกสารได้\n\nกรุณาส่งภาพใบเสร็จ, สลิปโอนเงิน หรือบิลค่าใช้จ่ายเท่านั้น'
     );
     return;
   }
 
   if (receipt.expense_type === 'Group_Tour') {
-    // Store and ask user to pick tour group
     pendingReceipts.set(userId, {
       receipt,
       imageMessageId: messageId,
       createdAt: Date.now(),
     });
-
     await replyFlexTourGroupSelector(replyToken, {
       merchant: receipt.merchant_name,
       amount: receipt.total_amount,
@@ -75,7 +198,6 @@ async function handleImageMessage(event: WebhookEvent): Promise<void> {
     return;
   }
 
-  // Office expense — write to Sheets immediately
   const row: SheetRow = {
     date: receipt.date,
     merchant_name: receipt.merchant_name,
@@ -83,6 +205,8 @@ async function handleImageMessage(event: WebhookEvent): Promise<void> {
     category: receipt.category,
     expense_type: receipt.expense_type,
     tour_group: '',
+    submitted_by: getUserDisplayName(userId),
+    department: getUserDepartment(userId),
     line_message_id: messageId,
     recorded_at: new Date().toISOString(),
   };
@@ -100,6 +224,8 @@ async function handleImageMessage(event: WebhookEvent): Promise<void> {
   );
 }
 
+// ─── Event: Postback ───────────────────────────────────────────────────────────
+
 async function handlePostback(event: WebhookEvent): Promise<void> {
   if (event.type !== 'postback') return;
 
@@ -112,10 +238,7 @@ async function handlePostback(event: WebhookEvent): Promise<void> {
   const pending = pendingReceipts.get(userId);
 
   if (!pending) {
-    await replyText(
-      event.replyToken,
-      'ไม่พบข้อมูลใบเสร็จที่รอดำเนินการ\nกรุณาส่งภาพใบเสร็จอีกครั้ง'
-    );
+    await replyText(event.replyToken, 'ไม่พบข้อมูลใบเสร็จที่รอดำเนินการ\nกรุณาส่งภาพใบเสร็จอีกครั้ง');
     return;
   }
 
@@ -129,6 +252,8 @@ async function handlePostback(event: WebhookEvent): Promise<void> {
     category: receipt.category,
     expense_type: receipt.expense_type,
     tour_group: tourGroup,
+    submitted_by: getUserDisplayName(userId),
+    department: getUserDepartment(userId),
     line_message_id: imageMessageId,
     recorded_at: new Date().toISOString(),
   };
@@ -160,7 +285,6 @@ router.post('/', async (req: Request, res: Response) => {
       return res.status(403).json({ error: 'Invalid signature' });
     }
   } catch {
-    // timingSafeEqual throws if buffers differ in length
     return res.status(403).json({ error: 'Invalid signature' });
   }
 
@@ -171,8 +295,12 @@ router.post('/', async (req: Request, res: Response) => {
 
   for (const event of events) {
     try {
-      if (event.type === 'message' && event.message.type === 'image') {
+      if (event.type === 'follow') {
+        await handleFollowEvent(event);
+      } else if (event.type === 'message' && event.message.type === 'image') {
         await handleImageMessage(event);
+      } else if (event.type === 'message' && event.message.type === 'text') {
+        await handleTextMessage(event);
       } else if (event.type === 'postback') {
         await handlePostback(event);
       }
