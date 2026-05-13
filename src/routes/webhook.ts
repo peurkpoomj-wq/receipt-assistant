@@ -48,30 +48,53 @@ async function handleImageMessage(event: WebhookEvent): Promise<void> {
 
   logger.info('Image message received', { messageId, userId });
 
-  const imageBuffer = await downloadLineImage(messageId);
-  const receipt = await extractReceiptData(imageBuffer);
+  let imageBuffer: Buffer;
+  try {
+    imageBuffer = await downloadLineImage(messageId);
+    logger.info('Image downloaded', { messageId, sizeKB: Math.round(imageBuffer.length / 1024) });
+  } catch (err) {
+    logger.error('Failed to download image from LINE', { messageId, err });
+    await replyText(replyToken, 'ไม่สามารถดาวน์โหลดภาพได้ กรุณาลองใหม่อีกครั้ง').catch(() => {});
+    return;
+  }
+
+  let receipt;
+  try {
+    receipt = await extractReceiptData(imageBuffer);
+  } catch (err) {
+    logger.error('Vision API error', { messageId, err });
+    await replyText(replyToken, 'เกิดข้อผิดพลาดในการอ่านภาพ กรุณาลองใหม่อีกครั้ง').catch(() => {});
+    return;
+  }
+
+  logger.info('Receipt extracted', { messageId, receipt });
 
   if (receipt.error) {
+    logger.warn('Receipt not a financial document', { messageId, error: receipt.error });
     await replyText(
       replyToken,
       `ไม่สามารถอ่านเอกสารได้\n\nกรุณาส่งภาพใบเสร็จ, สลิปโอนเงิน หรือบิลค่าใช้จ่ายเท่านั้น`
-    );
+    ).catch(() => {});
     return;
   }
 
   if (receipt.expense_type === 'Group_Tour') {
     // Store and ask user to pick tour group
-    pendingReceipts.set(userId, {
+    // Use messageId as key (not userId) to avoid overwriting when multiple images sent at once
+    const pendingKey = `${userId}:${messageId}`;
+    pendingReceipts.set(pendingKey, {
       receipt,
       imageMessageId: messageId,
       createdAt: Date.now(),
     });
+    logger.info('Stored pending Group_Tour receipt', { pendingKey, merchant: receipt.merchant_name });
 
     await replyFlexTourGroupSelector(replyToken, {
       merchant: receipt.merchant_name,
       amount: receipt.total_amount,
       category: receipt.category,
-    });
+      messageId,
+    }).catch((err) => logger.error('Failed to send Flex Message', { err }));
     return;
   }
 
@@ -87,17 +110,25 @@ async function handleImageMessage(event: WebhookEvent): Promise<void> {
     recorded_at: new Date().toISOString(),
   };
 
-  await appendReceiptRow(row);
+  try {
+    await appendReceiptRow(row);
+    logger.info('Row appended to Sheets', { merchant: receipt.merchant_name, amount: receipt.total_amount });
+  } catch (err) {
+    logger.error('Failed to write to Google Sheets', { err, row });
+    await replyText(replyToken, `อ่านสลิปได้แล้ว แต่บันทึก Sheet ไม่สำเร็จ\nร้าน: ${receipt.merchant_name} ฿${receipt.total_amount}`).catch(() => {});
+    return;
+  }
+
   await replyText(
     replyToken,
     [
-      'บันทึกรายจ่ายเรียบร้อยแล้ว!',
+      '✅ บันทึกรายจ่ายเรียบร้อยแล้ว!',
       '─────────────────────',
       `   ร้าน : ${receipt.merchant_name}`,
       `   ยอด  : ฿${receipt.total_amount.toLocaleString('th-TH', { minimumFractionDigits: 2 })}`,
       `   หมวด : ${receipt.category}`,
     ].join('\n')
-  );
+  ).catch((err) => logger.warn('Reply failed (token may have expired)', { err }));
 }
 
 async function handlePostback(event: WebhookEvent): Promise<void> {
@@ -109,9 +140,25 @@ async function handlePostback(event: WebhookEvent): Promise<void> {
   if (params.get('action') !== 'select_tour') return;
 
   const tourGroup = decodeURIComponent(params.get('group') ?? '');
-  const pending = pendingReceipts.get(userId);
+  const messageId = params.get('msgId') ?? '';
 
-  if (!pending) {
+  // Try specific key first (userId:messageId), then fall back to any pending for this user
+  const specificKey = `${userId}:${messageId}`;
+  let pendingKey = pendingReceipts.has(specificKey) ? specificKey : undefined;
+
+  if (!pendingKey) {
+    // Find any pending receipt for this user
+    for (const key of pendingReceipts.keys()) {
+      if (key.startsWith(`${userId}:`)) {
+        pendingKey = key;
+        break;
+      }
+    }
+  }
+
+  const pending = pendingKey ? pendingReceipts.get(pendingKey) : undefined;
+
+  if (!pending || !pendingKey) {
     await replyText(
       event.replyToken,
       'ไม่พบข้อมูลใบเสร็จที่รอดำเนินการ\nกรุณาส่งภาพใบเสร็จอีกครั้ง'
@@ -119,7 +166,7 @@ async function handlePostback(event: WebhookEvent): Promise<void> {
     return;
   }
 
-  pendingReceipts.delete(userId);
+  pendingReceipts.delete(pendingKey);
 
   const { receipt, imageMessageId } = pending;
   const row: SheetRow = {

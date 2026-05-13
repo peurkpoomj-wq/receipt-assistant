@@ -32,7 +32,7 @@ export async function replyText(replyToken: string, text: string): Promise<void>
 
 export async function replyFlexTourGroupSelector(
   replyToken: string,
-  summary: { merchant: string; amount: number; category: string }
+  summary: { merchant: string; amount: number; category: string; messageId?: string }
 ): Promise<void> {
   const amountFormatted = summary.amount.toLocaleString('th-TH', {
     minimumFractionDigits: 2,
@@ -40,6 +40,7 @@ export async function replyFlexTourGroupSelector(
   });
 
   // Build one button per tour group
+  const msgParam = summary.messageId ? `&msgId=${encodeURIComponent(summary.messageId)}` : '';
   const buttons = TOUR_GROUPS.map(
     (group): messagingApi.FlexButton => ({
       type: 'button',
@@ -48,7 +49,7 @@ export async function replyFlexTourGroupSelector(
       action: {
         type: 'postback',
         label: group,
-        data: `action=select_tour&group=${encodeURIComponent(group)}`,
+        data: `action=select_tour&group=${encodeURIComponent(group)}${msgParam}`,
         displayText: `เลือก: ${group}`,
       },
     })
