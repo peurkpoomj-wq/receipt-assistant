@@ -113,7 +113,10 @@ export async function ensureHeaderRow(): Promise<void> {
     range: `${sheetName}!A1:J1`,
   });
 
-  if (!existing.data.values?.length) {
+  const existingHeaders = (existing.data.values?.[0] ?? []) as string[];
+
+  if (existingHeaders.length === 0) {
+    // Fresh sheet — write full headers
     await sheets.spreadsheets.values.update({
       spreadsheetId,
       range: `${sheetName}!A1:J1`,
@@ -121,6 +124,18 @@ export async function ensureHeaderRow(): Promise<void> {
       requestBody: { values: [HEADERS] },
     });
     logger.info('Created header row in Google Sheets');
+    return;
+  }
+
+  // Migrate old 8-column sheet: add Submitted By and Department at I1:J1
+  if (existingHeaders.length === 8 && !existingHeaders.includes('Submitted By')) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: `${sheetName}!I1:J1`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [['Submitted By', 'Department']] },
+    });
+    logger.info('Migrated Google Sheets header: added Submitted By + Department columns');
   }
 }
 
