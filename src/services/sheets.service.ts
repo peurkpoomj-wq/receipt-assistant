@@ -70,7 +70,7 @@ async function getSheetsClient() {
   const authClient = auth instanceof UserRefreshClient
     ? auth
     : await (auth as GoogleAuth).getClient();
-  return google.sheets({ version: 'v4', auth: authClient as Parameters<typeof google.sheets>[0]['auth'] });
+  return google.sheets({ version: 'v4', auth: authClient as unknown as Parameters<typeof google.sheets>[0]['auth'] });
 }
 
 // ─── Public API ────────────────────────────────────────────────────────────────
