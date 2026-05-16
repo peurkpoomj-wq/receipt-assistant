@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
 import type { WebhookRequestBody, WebhookEvent } from '@line/bot-sdk';
-import type { PendingReceipt, SheetRow } from '../types';
+import type { PendingReceipt, SheetRow, Tenant } from '../types';
 import {
   downloadLineImage,
   replyText,
@@ -9,17 +9,18 @@ import {
   pushConfirmation,
 } from '../services/line.service';
 import { extractReceiptData } from '../services/vision.service';
-import { appendReceiptRow } from '../services/sheets.service';
+import { appendReceiptRow, ensureHeaderRow } from '../services/sheets.service';
+import { getTenantById, incrementReceiptCount } from '../db/tenants.repo';
+import { buildLegacyTenant } from '../services/sheets.service';
 import { logger } from '../utils/logger';
 
 const router = Router();
 
-// ─── In-memory pending store (userId → receipt awaiting tour group) ────────────
-// For production, swap with Redis: SET key JSON.stringify(pending) EX 1800
+// ─── In-memory pending store (tenantId:userId:messageId → receipt) ─────────────
 const pendingReceipts = new Map<string, PendingReceipt>();
 
 setInterval(() => {
-  const ttl = 30 * 60 * 1000; // 30 minutes
+  const ttl = 30 * 60 * 1000;
   const now = Date.now();
   for (const [key, val] of pendingReceipts) {
     if (now - val.createdAt > ttl) pendingReceipts.delete(key);
@@ -28,77 +29,100 @@ setInterval(() => {
 
 // ─── Signature Verification ────────────────────────────────────────────────────
 
-function verifySignature(rawBody: string, signature: string): boolean {
+function verifySignature(rawBody: string, signature: string, secret: string): boolean {
   const expected = crypto
-    .createHmac('sha256', process.env.LINE_CHANNEL_SECRET!)
+    .createHmac('sha256', secret)
     .update(rawBody)
     .digest('base64');
-  // Constant-time comparison to prevent timing attacks
-  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+  } catch {
+    return false;
+  }
+}
+
+// ─── Resolve Tenant ────────────────────────────────────────────────────────────
+
+async function resolveTenant(tenantId: string): Promise<Tenant | null> {
+  // "legacy" = single-tenant mode via env vars (backward compat)
+  if (tenantId === 'legacy') {
+    return buildLegacyTenant();
+  }
+
+  try {
+    // Check Supabase only if configured
+    if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
+      return await getTenantById(tenantId);
+    }
+  } catch (err) {
+    logger.warn('Supabase lookup failed, falling back to legacy', { err });
+  }
+
+  return null;
 }
 
 // ─── Event Handlers ────────────────────────────────────────────────────────────
 
-async function handleImageMessage(event: WebhookEvent): Promise<void> {
+async function handleImageMessage(event: WebhookEvent, tenant: Tenant): Promise<void> {
   if (event.type !== 'message' || event.message.type !== 'image') return;
 
   const messageId = event.message.id;
   const userId = event.source.userId ?? 'unknown';
   const { replyToken } = event;
 
-  logger.info('Image message received', { messageId, userId });
+  logger.info('Image received', { tenantId: tenant.id, messageId, userId });
 
+  // Download image
   let imageBuffer: Buffer;
   try {
-    imageBuffer = await downloadLineImage(messageId);
+    imageBuffer = await downloadLineImage(messageId, tenant);
     logger.info('Image downloaded', { messageId, sizeKB: Math.round(imageBuffer.length / 1024) });
   } catch (err) {
-    logger.error('Failed to download image from LINE', { messageId, err });
-    await replyText(replyToken, 'ไม่สามารถดาวน์โหลดภาพได้ กรุณาลองใหม่อีกครั้ง').catch(() => {});
+    logger.error('Image download failed', { messageId, err });
+    await replyText(replyToken, 'ไม่สามารถดาวน์โหลดภาพได้ กรุณาลองใหม่อีกครั้ง', tenant).catch(() => {});
     return;
   }
 
+  // Vision OCR
   let receipt;
   try {
     receipt = await extractReceiptData(imageBuffer);
   } catch (err) {
-    logger.error('Vision API error', { messageId, err });
-    await replyText(replyToken, 'เกิดข้อผิดพลาดในการอ่านภาพ กรุณาลองใหม่อีกครั้ง').catch(() => {});
+    logger.error('Vision API failed', { messageId, err });
+    await replyText(replyToken, 'เกิดข้อผิดพลาดในการอ่านภาพ กรุณาลองใหม่อีกครั้ง', tenant).catch(() => {});
     return;
   }
 
-  logger.info('Receipt extracted', { messageId, receipt });
+  logger.info('Receipt extracted', { messageId, merchant: receipt.merchant_name, amount: receipt.total_amount, type: receipt.expense_type, error: receipt.error });
 
   if (receipt.error) {
-    logger.warn('Receipt not a financial document', { messageId, error: receipt.error });
     await replyText(
       replyToken,
-      `ไม่สามารถอ่านเอกสารได้\n\nกรุณาส่งภาพใบเสร็จ, สลิปโอนเงิน หรือบิลค่าใช้จ่ายเท่านั้น`
+      'ไม่สามารถอ่านเอกสารได้\nกรุณาส่งภาพใบเสร็จ, สลิปโอนเงิน หรือบิลค่าใช้จ่ายเท่านั้น',
+      tenant
     ).catch(() => {});
     return;
   }
 
+  // Group_Tour → ask user to pick tour group
   if (receipt.expense_type === 'Group_Tour') {
-    // Store and ask user to pick tour group
-    // Use messageId as key (not userId) to avoid overwriting when multiple images sent at once
-    const pendingKey = `${userId}:${messageId}`;
+    const pendingKey = `${tenant.id}:${userId}:${messageId}`;
     pendingReceipts.set(pendingKey, {
       receipt,
       imageMessageId: messageId,
       createdAt: Date.now(),
     });
-    logger.info('Stored pending Group_Tour receipt', { pendingKey, merchant: receipt.merchant_name });
+    logger.info('Pending Group_Tour', { pendingKey, merchant: receipt.merchant_name });
 
-    await replyFlexTourGroupSelector(replyToken, {
-      merchant: receipt.merchant_name,
-      amount: receipt.total_amount,
-      category: receipt.category,
-      messageId,
-    }).catch((err) => logger.error('Failed to send Flex Message', { err }));
+    await replyFlexTourGroupSelector(
+      replyToken,
+      { merchant: receipt.merchant_name, amount: receipt.total_amount, category: receipt.category, messageId },
+      tenant
+    ).catch((err) => logger.error('Flex send failed', { err }));
     return;
   }
 
-  // Office expense — write to Sheets immediately
+  // Office → write to Sheets immediately
   const row: SheetRow = {
     date: receipt.date,
     merchant_name: receipt.merchant_name,
@@ -111,11 +135,11 @@ async function handleImageMessage(event: WebhookEvent): Promise<void> {
   };
 
   try {
-    await appendReceiptRow(row);
-    logger.info('Row appended to Sheets', { merchant: receipt.merchant_name, amount: receipt.total_amount });
+    await appendReceiptRow(row, tenant);
+    await incrementReceiptCount(tenant.id).catch(() => {});
   } catch (err) {
-    logger.error('Failed to write to Google Sheets', { err, row });
-    await replyText(replyToken, `อ่านสลิปได้แล้ว แต่บันทึก Sheet ไม่สำเร็จ\nร้าน: ${receipt.merchant_name} ฿${receipt.total_amount}`).catch(() => {});
+    logger.error('Sheets write failed', { err, merchant: row.merchant_name });
+    await replyText(replyToken, `อ่านสลิปได้แล้ว แต่บันทึก Sheet ไม่สำเร็จ\nร้าน: ${receipt.merchant_name} ฿${receipt.total_amount}`, tenant).catch(() => {});
     return;
   }
 
@@ -127,11 +151,12 @@ async function handleImageMessage(event: WebhookEvent): Promise<void> {
       `   ร้าน : ${receipt.merchant_name}`,
       `   ยอด  : ฿${receipt.total_amount.toLocaleString('th-TH', { minimumFractionDigits: 2 })}`,
       `   หมวด : ${receipt.category}`,
-    ].join('\n')
-  ).catch((err) => logger.warn('Reply failed (token may have expired)', { err }));
+    ].join('\n'),
+    tenant
+  ).catch((err) => logger.warn('Reply token expired', { err }));
 }
 
-async function handlePostback(event: WebhookEvent): Promise<void> {
+async function handlePostback(event: WebhookEvent, tenant: Tenant): Promise<void> {
   if (event.type !== 'postback') return;
 
   const userId = event.source.userId ?? 'unknown';
@@ -142,27 +167,21 @@ async function handlePostback(event: WebhookEvent): Promise<void> {
   const tourGroup = decodeURIComponent(params.get('group') ?? '');
   const messageId = params.get('msgId') ?? '';
 
-  // Try specific key first (userId:messageId), then fall back to any pending for this user
-  const specificKey = `${userId}:${messageId}`;
+  // Find pending receipt (specific key first, then any for this user)
+  const specificKey = `${tenant.id}:${userId}:${messageId}`;
   let pendingKey = pendingReceipts.has(specificKey) ? specificKey : undefined;
 
   if (!pendingKey) {
-    // Find any pending receipt for this user
+    const prefix = `${tenant.id}:${userId}:`;
     for (const key of pendingReceipts.keys()) {
-      if (key.startsWith(`${userId}:`)) {
-        pendingKey = key;
-        break;
-      }
+      if (key.startsWith(prefix)) { pendingKey = key; break; }
     }
   }
 
   const pending = pendingKey ? pendingReceipts.get(pendingKey) : undefined;
 
   if (!pending || !pendingKey) {
-    await replyText(
-      event.replyToken,
-      'ไม่พบข้อมูลใบเสร็จที่รอดำเนินการ\nกรุณาส่งภาพใบเสร็จอีกครั้ง'
-    );
+    await replyText(event.replyToken, 'ไม่พบข้อมูลใบเสร็จที่รอดำเนินการ\nกรุณาส่งภาพใบเสร็จอีกครั้ง', tenant);
     return;
   }
 
@@ -180,38 +199,49 @@ async function handlePostback(event: WebhookEvent): Promise<void> {
     recorded_at: new Date().toISOString(),
   };
 
-  await appendReceiptRow(row);
+  try {
+    await appendReceiptRow(row, tenant);
+    await incrementReceiptCount(tenant.id).catch(() => {});
+  } catch (err) {
+    logger.error('Sheets write failed (postback)', { err });
+    await replyText(event.replyToken, 'บันทึก Sheet ไม่สำเร็จ กรุณาลองใหม่', tenant);
+    return;
+  }
+
   await pushConfirmation(userId, {
     merchant: receipt.merchant_name,
     amount: receipt.total_amount,
     category: receipt.category,
     expenseType: receipt.expense_type,
     tourGroup,
-  });
+  }, tenant);
 }
 
-// ─── Webhook Route ─────────────────────────────────────────────────────────────
+// ─── Webhook Route — supports /webhook/:tenantId ───────────────────────────────
 
-router.post('/', async (req: Request, res: Response) => {
+router.post('/:tenantId?', async (req: Request, res: Response) => {
+  const tenantId = req.params.tenantId ?? 'legacy';
   const signature = req.headers['x-line-signature'] as string | undefined;
 
   if (!signature) {
-    return res.status(400).json({ error: 'Missing X-Line-Signature header' });
+    return res.status(400).json({ error: 'Missing X-Line-Signature' });
   }
 
-  const rawBody: string = (req as Request & { rawBody?: string }).rawBody ?? JSON.stringify(req.body);
+  // Resolve tenant
+  const tenant = await resolveTenant(tenantId);
+  if (!tenant) {
+    logger.warn('Unknown tenant', { tenantId });
+    return res.status(404).json({ error: 'Tenant not found' });
+  }
 
-  try {
-    if (!verifySignature(rawBody, signature)) {
-      logger.warn('LINE signature verification failed');
-      return res.status(403).json({ error: 'Invalid signature' });
-    }
-  } catch {
-    // timingSafeEqual throws if buffers differ in length
+  const rawBody: string = (req as any).rawBody ?? JSON.stringify(req.body);
+
+  if (!verifySignature(rawBody, signature, tenant.line_channel_secret)) {
+    logger.warn('Signature verification failed', { tenantId });
     return res.status(403).json({ error: 'Invalid signature' });
   }
 
-  // Respond 200 immediately — LINE requires a response within 30 s
+  // Respond 200 immediately (LINE requires < 30s)
   res.status(200).json({ status: 'ok' });
 
   const { events = [] } = req.body as WebhookRequestBody;
@@ -219,12 +249,12 @@ router.post('/', async (req: Request, res: Response) => {
   for (const event of events) {
     try {
       if (event.type === 'message' && event.message.type === 'image') {
-        await handleImageMessage(event);
+        await handleImageMessage(event, tenant);
       } else if (event.type === 'postback') {
-        await handlePostback(event);
+        await handlePostback(event, tenant);
       }
     } catch (err) {
-      logger.error(`Error handling ${event.type} event`, err);
+      logger.error(`Unhandled error in ${event.type} event`, { tenantId, err });
     }
   }
 });

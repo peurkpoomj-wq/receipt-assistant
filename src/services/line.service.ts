@@ -1,18 +1,33 @@
 import axios from 'axios';
 import { messagingApi } from '@line/bot-sdk';
-import { TOUR_GROUPS } from '../types';
+import { Tenant } from '../types';
 
 const LINE_CONTENT_API = 'https://api-data.line.me/v2/bot/message';
 
-const client = new messagingApi.MessagingApiClient({
-  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN!,
-});
+// ─── Per-Tenant Client Cache ───────────────────────────────────────────────────
+
+const clientCache = new Map<string, messagingApi.MessagingApiClient>();
+
+function getClient(tenant: Tenant): messagingApi.MessagingApiClient {
+  if (!clientCache.has(tenant.id)) {
+    clientCache.set(
+      tenant.id,
+      new messagingApi.MessagingApiClient({
+        channelAccessToken: tenant.line_channel_access_token,
+      })
+    );
+  }
+  return clientCache.get(tenant.id)!;
+}
 
 // ─── Image Download ────────────────────────────────────────────────────────────
 
-export async function downloadLineImage(messageId: string): Promise<Buffer> {
+export async function downloadLineImage(
+  messageId: string,
+  tenant: Tenant
+): Promise<Buffer> {
   const res = await axios.get(`${LINE_CONTENT_API}/${messageId}/content`, {
-    headers: { Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}` },
+    headers: { Authorization: `Bearer ${tenant.line_channel_access_token}` },
     responseType: 'arraybuffer',
     timeout: 15_000,
   });
@@ -21,8 +36,12 @@ export async function downloadLineImage(messageId: string): Promise<Buffer> {
 
 // ─── Reply Helpers ─────────────────────────────────────────────────────────────
 
-export async function replyText(replyToken: string, text: string): Promise<void> {
-  await client.replyMessage({
+export async function replyText(
+  replyToken: string,
+  text: string,
+  tenant: Tenant
+): Promise<void> {
+  await getClient(tenant).replyMessage({
     replyToken,
     messages: [{ type: 'text', text }],
   });
@@ -32,16 +51,19 @@ export async function replyText(replyToken: string, text: string): Promise<void>
 
 export async function replyFlexTourGroupSelector(
   replyToken: string,
-  summary: { merchant: string; amount: number; category: string; messageId?: string }
+  summary: { merchant: string; amount: number; category: string; messageId?: string },
+  tenant: Tenant
 ): Promise<void> {
   const amountFormatted = summary.amount.toLocaleString('th-TH', {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
 
-  // Build one button per tour group
-  const msgParam = summary.messageId ? `&msgId=${encodeURIComponent(summary.messageId)}` : '';
-  const buttons = TOUR_GROUPS.map(
+  const msgParam = summary.messageId
+    ? `&msgId=${encodeURIComponent(summary.messageId)}`
+    : '';
+
+  const buttons = tenant.tour_groups.map(
     (group): messagingApi.FlexButton => ({
       type: 'button',
       style: 'primary',
@@ -120,12 +142,12 @@ export async function replyFlexTourGroupSelector(
     },
   };
 
-  await client.replyMessage({
+  await getClient(tenant).replyMessage({
     replyToken,
     messages: [
       {
         type: 'flex',
-        altText: `ค่าใช้จ่ายกรุ๊ปทัวร์: ${summary.merchant} ฿${amountFormatted} — กรุณาเลือกกรุ๊ป`,
+        altText: `ค่าใช้จ่ายกรุ๊ปทัวร์: ${summary.merchant} ฿${amountFormatted}`,
         contents: bubble,
       },
     ],
@@ -142,7 +164,8 @@ export async function pushConfirmation(
     category: string;
     expenseType: string;
     tourGroup?: string;
-  }
+  },
+  tenant: Tenant
 ): Promise<void> {
   const amountFormatted = data.amount.toLocaleString('th-TH', {
     minimumFractionDigits: 2,
@@ -150,7 +173,7 @@ export async function pushConfirmation(
   });
   const tourLine = data.tourGroup ? `\n   กรุ๊ป : ${data.tourGroup}` : '';
   const text = [
-    'บันทึกรายจ่ายเรียบร้อยแล้ว!',
+    '✅ บันทึกรายจ่ายเรียบร้อยแล้ว!',
     '─────────────────────',
     `   ร้าน : ${data.merchant}`,
     `   ยอด  : ฿${amountFormatted}`,
@@ -158,5 +181,8 @@ export async function pushConfirmation(
     `   ประเภท: ${data.expenseType}${tourLine}`,
   ].join('\n');
 
-  await client.pushMessage({ to: userId, messages: [{ type: 'text', text }] });
+  await getClient(tenant).pushMessage({
+    to: userId,
+    messages: [{ type: 'text', text }],
+  });
 }
