@@ -15,7 +15,6 @@ const VALID_CATEGORIES: ExtractedReceipt['category'][] = [
   'เดินทางและที่พัก',
   'จิปาถะ',
 ];
-const VALID_EXPENSE_TYPES: ExtractedReceipt['expense_type'][] = ['Office', 'Group_Tour'];
 
 function validate(raw: unknown): ExtractedReceipt {
   if (typeof raw !== 'object' || raw === null) {
@@ -35,16 +34,12 @@ function validate(raw: unknown): ExtractedReceipt {
   if (!VALID_CATEGORIES.includes(obj.category as ExtractedReceipt['category'])) {
     throw new Error(`Invalid category: "${obj.category}"`);
   }
-  if (!VALID_EXPENSE_TYPES.includes(obj.expense_type as ExtractedReceipt['expense_type'])) {
-    throw new Error(`Invalid expense_type: "${obj.expense_type}"`);
-  }
 
   return {
     date: obj.date,
     merchant_name: obj.merchant_name,
     total_amount: obj.total_amount,
     category: obj.category as ExtractedReceipt['category'],
-    expense_type: obj.expense_type as ExtractedReceipt['expense_type'],
   };
 }
 
@@ -85,7 +80,6 @@ export async function extractReceiptData(imageBuffer: Buffer): Promise<Extracted
   logger.info('Extracted receipt data', {
     merchant: result.merchant_name,
     amount: result.total_amount,
-    expense_type: result.expense_type,
     error: result.error,
   });
 

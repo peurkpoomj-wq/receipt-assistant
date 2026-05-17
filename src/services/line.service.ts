@@ -1,12 +1,23 @@
 import axios from 'axios';
 import { messagingApi } from '@line/bot-sdk';
-import { TOUR_GROUPS } from '../types';
+import { DEFAULT_COST_CENTERS } from '../types';
 
 const LINE_CONTENT_API = 'https://api-data.line.me/v2/bot/message';
 
 const client = new messagingApi.MessagingApiClient({
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN!,
 });
+
+// ─── Cost Centers — from env var or defaults ───────────────────────────────────
+
+export function getCostCenters(): string[] {
+  const raw = process.env.COST_CENTERS;
+  if (raw) {
+    const parsed = raw.split(',').map(s => s.trim()).filter(Boolean);
+    if (parsed.length > 0) return parsed;
+  }
+  return [...DEFAULT_COST_CENTERS];
+}
 
 // ─── Image Download ────────────────────────────────────────────────────────────
 
@@ -28,29 +39,34 @@ export async function replyText(replyToken: string, text: string): Promise<void>
   });
 }
 
-// ─── Flex Message: Tour Group Selector ────────────────────────────────────────
+// ─── Flex Message: Cost Center Selector ───────────────────────────────────────
 
-export async function replyFlexTourGroupSelector(
+export async function replyFlexCostCenterSelector(
   replyToken: string,
-  summary: { merchant: string; amount: number; category: string; messageId?: string }
+  summary: {
+    merchant: string;
+    amount: number;
+    category: string;
+    messageId?: string;
+    costCenters: string[];
+  }
 ): Promise<void> {
   const amountFormatted = summary.amount.toLocaleString('th-TH', {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
 
-  // Build one button per tour group
   const msgParam = summary.messageId ? `&msgId=${encodeURIComponent(summary.messageId)}` : '';
-  const buttons = TOUR_GROUPS.map(
-    (group): messagingApi.FlexButton => ({
+  const buttons = summary.costCenters.map(
+    (center): messagingApi.FlexButton => ({
       type: 'button',
       style: 'primary',
       height: 'sm',
       action: {
         type: 'postback',
-        label: group,
-        data: `action=select_tour&group=${encodeURIComponent(group)}${msgParam}`,
-        displayText: `เลือก: ${group}`,
+        label: center,
+        data: `action=select_cost_center&center=${encodeURIComponent(center)}${msgParam}`,
+        displayText: `เลือก: ${center}`,
       },
     })
   );
@@ -66,7 +82,7 @@ export async function replyFlexTourGroupSelector(
       contents: [
         {
           type: 'text',
-          text: 'ค่าใช้จ่ายกรุ๊ปทัวร์',
+          text: '📂 เลือก Cost Center',
           weight: 'bold',
           size: 'lg',
           color: '#FFFFFF',
@@ -103,7 +119,7 @@ export async function replyFlexTourGroupSelector(
         { type: 'separator', margin: 'md' },
         {
           type: 'text',
-          text: 'ค่าใช้จ่ายนี้เป็นของกรุ๊ปทัวร์ไหน?',
+          text: 'ค่าใช้จ่ายนี้อยู่ใน Cost Center ไหน?',
           size: 'sm',
           margin: 'md',
           wrap: true,
@@ -125,7 +141,7 @@ export async function replyFlexTourGroupSelector(
     messages: [
       {
         type: 'flex',
-        altText: `ค่าใช้จ่ายกรุ๊ปทัวร์: ${summary.merchant} ฿${amountFormatted} — กรุณาเลือกกรุ๊ป`,
+        altText: `เลือก Cost Center: ${summary.merchant} ฿${amountFormatted}`,
         contents: bubble,
       },
     ],
@@ -140,22 +156,20 @@ export async function pushConfirmation(
     merchant: string;
     amount: number;
     category: string;
-    expenseType: string;
-    tourGroup?: string;
+    costCenter: string;
   }
 ): Promise<void> {
   const amountFormatted = data.amount.toLocaleString('th-TH', {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
-  const tourLine = data.tourGroup ? `\n   กรุ๊ป : ${data.tourGroup}` : '';
   const text = [
-    'บันทึกรายจ่ายเรียบร้อยแล้ว!',
+    '✅ บันทึกรายจ่ายเรียบร้อยแล้ว!',
     '─────────────────────',
-    `   ร้าน : ${data.merchant}`,
-    `   ยอด  : ฿${amountFormatted}`,
-    `   หมวด : ${data.category}`,
-    `   ประเภท: ${data.expenseType}${tourLine}`,
+    `   ร้าน       : ${data.merchant}`,
+    `   ยอด        : ฿${amountFormatted}`,
+    `   หมวด       : ${data.category}`,
+    `   Cost Center: ${data.costCenter}`,
   ].join('\n');
 
   await client.pushMessage({ to: userId, messages: [{ type: 'text', text }] });

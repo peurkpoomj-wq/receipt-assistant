@@ -5,8 +5,9 @@ import type { PendingReceipt, SheetRow } from '../types';
 import {
   downloadLineImage,
   replyText,
-  replyFlexTourGroupSelector,
+  replyFlexCostCenterSelector,
   pushConfirmation,
+  getCostCenters,
 } from '../services/line.service';
 import { extractReceiptData } from '../services/vision.service';
 import { appendReceiptRow } from '../services/sheets.service';
@@ -14,8 +15,7 @@ import { logger } from '../utils/logger';
 
 const router = Router();
 
-// ─── In-memory pending store (userId → receipt awaiting tour group) ────────────
-// For production, swap with Redis: SET key JSON.stringify(pending) EX 1800
+// ─── In-memory pending store ───────────────────────────────────────────────────
 const pendingReceipts = new Map<string, PendingReceipt>();
 
 setInterval(() => {
@@ -33,7 +33,6 @@ function verifySignature(rawBody: string, signature: string): boolean {
     .createHmac('sha256', process.env.LINE_CHANNEL_SECRET!)
     .update(rawBody)
     .digest('base64');
-  // Constant-time comparison to prevent timing attacks
   return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
 }
 
@@ -70,7 +69,7 @@ async function handleImageMessage(event: WebhookEvent): Promise<void> {
   logger.info('Receipt extracted', { messageId, receipt });
 
   if (receipt.error) {
-    logger.warn('Receipt not a financial document', { messageId, error: receipt.error });
+    logger.warn('Not a financial document', { messageId, error: receipt.error });
     await replyText(
       replyToken,
       `ไม่สามารถอ่านเอกสารได้\n\nกรุณาส่งภาพใบเสร็จ, สลิปโอนเงิน หรือบิลค่าใช้จ่ายเท่านั้น`
@@ -78,57 +77,56 @@ async function handleImageMessage(event: WebhookEvent): Promise<void> {
     return;
   }
 
-  if (receipt.expense_type === 'Group_Tour') {
-    // Store and ask user to pick tour group
-    // Use messageId as key (not userId) to avoid overwriting when multiple images sent at once
-    const pendingKey = `${userId}:${messageId}`;
-    pendingReceipts.set(pendingKey, {
-      receipt,
-      imageMessageId: messageId,
-      createdAt: Date.now(),
-    });
-    logger.info('Stored pending Group_Tour receipt', { pendingKey, merchant: receipt.merchant_name });
+  const costCenters = getCostCenters();
 
-    await replyFlexTourGroupSelector(replyToken, {
-      merchant: receipt.merchant_name,
-      amount: receipt.total_amount,
+  // Auto-save if only 1 cost center configured
+  if (costCenters.length === 1) {
+    const row: SheetRow = {
+      date: receipt.date,
+      merchant_name: receipt.merchant_name,
+      total_amount: receipt.total_amount,
       category: receipt.category,
-      messageId,
-    }).catch((err) => logger.error('Failed to send Flex Message', { err }));
+      cost_center: costCenters[0],
+      line_message_id: messageId,
+      recorded_at: new Date().toISOString(),
+    };
+    try {
+      await appendReceiptRow(row);
+    } catch (err) {
+      logger.error('Failed to write to Google Sheets', { err });
+      await replyText(replyToken, `อ่านสลิปได้แล้ว แต่บันทึก Sheet ไม่สำเร็จ\nร้าน: ${receipt.merchant_name} ฿${receipt.total_amount}`).catch(() => {});
+      return;
+    }
+    await replyText(
+      replyToken,
+      [
+        '✅ บันทึกรายจ่ายเรียบร้อยแล้ว!',
+        '─────────────────────',
+        `   ร้าน       : ${receipt.merchant_name}`,
+        `   ยอด        : ฿${receipt.total_amount.toLocaleString('th-TH', { minimumFractionDigits: 2 })}`,
+        `   หมวด       : ${receipt.category}`,
+        `   Cost Center: ${costCenters[0]}`,
+      ].join('\n')
+    ).catch((err) => logger.warn('Reply failed', { err }));
     return;
   }
 
-  // Office expense — write to Sheets immediately
-  const row: SheetRow = {
-    date: receipt.date,
-    merchant_name: receipt.merchant_name,
-    total_amount: receipt.total_amount,
+  // Multiple cost centers → ask user to pick
+  const pendingKey = `${userId}:${messageId}`;
+  pendingReceipts.set(pendingKey, {
+    receipt,
+    imageMessageId: messageId,
+    createdAt: Date.now(),
+  });
+  logger.info('Stored pending receipt, awaiting cost center', { pendingKey, merchant: receipt.merchant_name });
+
+  await replyFlexCostCenterSelector(replyToken, {
+    merchant: receipt.merchant_name,
+    amount: receipt.total_amount,
     category: receipt.category,
-    expense_type: receipt.expense_type,
-    tour_group: '',
-    line_message_id: messageId,
-    recorded_at: new Date().toISOString(),
-  };
-
-  try {
-    await appendReceiptRow(row);
-    logger.info('Row appended to Sheets', { merchant: receipt.merchant_name, amount: receipt.total_amount });
-  } catch (err) {
-    logger.error('Failed to write to Google Sheets', { err, row });
-    await replyText(replyToken, `อ่านสลิปได้แล้ว แต่บันทึก Sheet ไม่สำเร็จ\nร้าน: ${receipt.merchant_name} ฿${receipt.total_amount}`).catch(() => {});
-    return;
-  }
-
-  await replyText(
-    replyToken,
-    [
-      '✅ บันทึกรายจ่ายเรียบร้อยแล้ว!',
-      '─────────────────────',
-      `   ร้าน : ${receipt.merchant_name}`,
-      `   ยอด  : ฿${receipt.total_amount.toLocaleString('th-TH', { minimumFractionDigits: 2 })}`,
-      `   หมวด : ${receipt.category}`,
-    ].join('\n')
-  ).catch((err) => logger.warn('Reply failed (token may have expired)', { err }));
+    messageId,
+    costCenters,
+  }).catch((err) => logger.error('Failed to send Flex Message', { err }));
 }
 
 async function handlePostback(event: WebhookEvent): Promise<void> {
@@ -137,22 +135,17 @@ async function handlePostback(event: WebhookEvent): Promise<void> {
   const userId = event.source.userId ?? 'unknown';
   const params = new URLSearchParams(event.postback.data);
 
-  if (params.get('action') !== 'select_tour') return;
+  if (params.get('action') !== 'select_cost_center') return;
 
-  const tourGroup = decodeURIComponent(params.get('group') ?? '');
+  const costCenter = decodeURIComponent(params.get('center') ?? '');
   const messageId = params.get('msgId') ?? '';
 
-  // Try specific key first (userId:messageId), then fall back to any pending for this user
   const specificKey = `${userId}:${messageId}`;
   let pendingKey = pendingReceipts.has(specificKey) ? specificKey : undefined;
 
   if (!pendingKey) {
-    // Find any pending receipt for this user
     for (const key of pendingReceipts.keys()) {
-      if (key.startsWith(`${userId}:`)) {
-        pendingKey = key;
-        break;
-      }
+      if (key.startsWith(`${userId}:`)) { pendingKey = key; break; }
     }
   }
 
@@ -174,19 +167,24 @@ async function handlePostback(event: WebhookEvent): Promise<void> {
     merchant_name: receipt.merchant_name,
     total_amount: receipt.total_amount,
     category: receipt.category,
-    expense_type: receipt.expense_type,
-    tour_group: tourGroup,
+    cost_center: costCenter,
     line_message_id: imageMessageId,
     recorded_at: new Date().toISOString(),
   };
 
-  await appendReceiptRow(row);
+  try {
+    await appendReceiptRow(row);
+  } catch (err) {
+    logger.error('Failed to write to Sheets (postback)', { err });
+    await replyText(event.replyToken, 'บันทึก Sheet ไม่สำเร็จ กรุณาลองใหม่');
+    return;
+  }
+
   await pushConfirmation(userId, {
     merchant: receipt.merchant_name,
     amount: receipt.total_amount,
     category: receipt.category,
-    expenseType: receipt.expense_type,
-    tourGroup,
+    costCenter,
   });
 }
 
@@ -207,11 +205,9 @@ router.post('/', async (req: Request, res: Response) => {
       return res.status(403).json({ error: 'Invalid signature' });
     }
   } catch {
-    // timingSafeEqual throws if buffers differ in length
     return res.status(403).json({ error: 'Invalid signature' });
   }
 
-  // Respond 200 immediately — LINE requires a response within 30 s
   res.status(200).json({ status: 'ok' });
 
   const { events = [] } = req.body as WebhookRequestBody;

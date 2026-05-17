@@ -12,8 +12,7 @@ const HEADERS = [
   'Merchant',
   'Amount (THB)',
   'Category',
-  'Expense Type',
-  'Tour Group',
+  'Cost Center',
   'LINE Message ID',
   'Recorded At',
 ];
@@ -84,15 +83,14 @@ export async function appendReceiptRow(row: SheetRow): Promise<void> {
     row.merchant_name,
     row.total_amount,
     row.category,
-    row.expense_type,
-    row.tour_group,
+    row.cost_center,
     row.line_message_id,
     row.recorded_at,
   ]];
 
   await sheets.spreadsheets.values.append({
     spreadsheetId,
-    range: `${sheetName}!A:H`,
+    range: `${sheetName}!A:G`,
     valueInputOption: 'USER_ENTERED', // lets Sheets parse dates and numbers
     requestBody: { values },
   });
@@ -100,7 +98,7 @@ export async function appendReceiptRow(row: SheetRow): Promise<void> {
   logger.info('Appended row to Sheets', {
     merchant: row.merchant_name,
     amount: row.total_amount,
-    tour_group: row.tour_group || '—',
+    cost_center: row.cost_center || '—',
   });
 }
 
@@ -111,13 +109,13 @@ export async function ensureHeaderRow(): Promise<void> {
 
   const existing = await sheets.spreadsheets.values.get({
     spreadsheetId,
-    range: `${sheetName}!A1:H1`,
+    range: `${sheetName}!A1:G1`,
   });
 
   if (!existing.data.values?.length) {
     await sheets.spreadsheets.values.update({
       spreadsheetId,
-      range: `${sheetName}!A1:H1`,
+      range: `${sheetName}!A1:G1`,
       valueInputOption: 'RAW',
       requestBody: { values: [HEADERS] },
     });
