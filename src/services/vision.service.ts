@@ -1,12 +1,12 @@
-import OpenAI from 'openai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import { ExtractedReceipt } from '../types';
 import { RECEIPT_SYSTEM_PROMPT } from '../prompts/receipt.prompt';
 import { logger } from '../utils/logger';
 
-let _openai: OpenAI | null = null;
-function getOpenAI(): OpenAI {
-  if (!_openai) _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  return _openai;
+let _genAI: GoogleGenerativeAI | null = null;
+function getGenAI(): GoogleGenerativeAI {
+  if (!_genAI) _genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+  return _genAI;
 }
 
 const VALID_CATEGORIES: ExtractedReceipt['category'][] = [
@@ -45,43 +45,42 @@ function validate(raw: unknown): ExtractedReceipt {
 
 export async function extractReceiptData(imageBuffer: Buffer): Promise<ExtractedReceipt> {
   const base64 = imageBuffer.toString('base64');
-  const model = process.env.OPENAI_MODEL ?? 'gpt-4o';
+  const modelName = process.env.GEMINI_MODEL ?? 'gemini-2.0-flash';
 
-  logger.info('Calling Vision API', { model, imageSizeKB: Math.round(imageBuffer.length / 1024) });
+  logger.info('Calling Gemini Vision API', { model: modelName, imageSizeKB: Math.round(imageBuffer.length / 1024) });
 
-  const response = await getOpenAI().chat.completions.create({
-    model,
-    messages: [
-      { role: 'system', content: RECEIPT_SYSTEM_PROMPT },
-      {
-        role: 'user',
-        content: [
-          {
-            type: 'image_url',
-            image_url: { url: `data:image/jpeg;base64,${base64}`, detail: 'high' },
-          },
-          { type: 'text', text: 'กรุณาดึงข้อมูลจากเอกสารนี้' },
-        ],
-      },
-    ],
-    max_tokens: 500,
-    temperature: 0,
-    response_format: { type: 'json_object' }, // guarantees valid JSON output
+  const geminiModel = getGenAI().getGenerativeModel({
+    model: modelName,
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: 'application/json',
+    },
   });
 
-  const rawContent = response.choices[0]?.message?.content;
-  if (!rawContent) throw new Error('Empty response from Vision API');
+  const result = await geminiModel.generateContent([
+    { inlineData: { data: base64, mimeType: 'image/jpeg' } },
+    RECEIPT_SYSTEM_PROMPT + '\n\nกรุณาดึงข้อมูลจากเอกสารนี้',
+  ]);
 
-  logger.debug('Vision API raw output', { content: rawContent });
+  const rawContent = result.response.text();
+  if (!rawContent) throw new Error('Empty response from Gemini API');
 
-  const parsed: unknown = JSON.parse(rawContent);
-  const result = validate(parsed);
+  logger.debug('Gemini raw output', { content: rawContent });
+
+  // Strip markdown fences in case Gemini wraps output in ```json ... ```
+  const cleaned = rawContent
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+
+  const parsed: unknown = JSON.parse(cleaned);
+  const receipt = validate(parsed);
 
   logger.info('Extracted receipt data', {
-    merchant: result.merchant_name,
-    amount: result.total_amount,
-    error: result.error,
+    merchant: receipt.merchant_name,
+    amount: receipt.total_amount,
+    error: receipt.error,
   });
 
-  return result;
+  return receipt;
 }

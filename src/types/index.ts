@@ -12,12 +12,14 @@ export interface PendingReceipt {
   createdAt: number;
 }
 
+// Default cost centers — override via COST_CENTERS env var (comma-separated)
 export const DEFAULT_COST_CENTERS = [
-  'ทั่วไป',
-  'แผนกขาย',
-  'แผนกการตลาด',
-  'แผนกปฏิบัติการ',
-  'แผนกบัญชี',
+  'กรุ๊ปญี่ปุ่น',
+  'กรุ๊ปเกาหลี',
+  'กรุ๊ปยุโรป',
+  'กรุ๊ปจีน',
+  'กรุ๊ปออสเตรเลีย',
+  'Office',
 ] as const;
 
 export interface SheetRow {
