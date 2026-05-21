@@ -23,7 +23,6 @@ function validate(raw: unknown): ExtractedReceipt {
 
   const obj = raw as Record<string, unknown>;
 
-  // Error response from AI (unreadable image)
   if (typeof obj.error === 'string') {
     return { error: obj.error } as ExtractedReceipt;
   }
@@ -43,6 +42,37 @@ function validate(raw: unknown): ExtractedReceipt {
   };
 }
 
+// Retry with exponential backoff for rate limit errors (429)
+async function callGeminiWithRetry(
+  geminiModel: ReturnType<GoogleGenerativeAI['getGenerativeModel']>,
+  base64: string,
+  maxRetries = 3
+): Promise<string> {
+  const delays = [10_000, 30_000, 60_000]; // 10s, 30s, 60s
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const result = await geminiModel.generateContent([
+        { inlineData: { data: base64, mimeType: 'image/jpeg' } },
+        RECEIPT_SYSTEM_PROMPT + '\n\nกรุณาดึงข้อมูลจากเอกสารนี้',
+      ]);
+      return result.response.text();
+    } catch (err: unknown) {
+      const status = (err as { status?: number })?.status;
+      const isRateLimit = status === 429;
+
+      if (isRateLimit && attempt < maxRetries) {
+        const delay = delays[attempt] ?? 60_000;
+        logger.warn(`Gemini rate limit (429) — retry ${attempt + 1}/${maxRetries} in ${delay / 1000}s`);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('Gemini: max retries exceeded');
+}
+
 export async function extractReceiptData(imageBuffer: Buffer): Promise<ExtractedReceipt> {
   const base64 = imageBuffer.toString('base64');
   const modelName = process.env.GEMINI_MODEL ?? 'gemini-2.0-flash';
@@ -57,17 +87,11 @@ export async function extractReceiptData(imageBuffer: Buffer): Promise<Extracted
     },
   });
 
-  const result = await geminiModel.generateContent([
-    { inlineData: { data: base64, mimeType: 'image/jpeg' } },
-    RECEIPT_SYSTEM_PROMPT + '\n\nกรุณาดึงข้อมูลจากเอกสารนี้',
-  ]);
-
-  const rawContent = result.response.text();
+  const rawContent = await callGeminiWithRetry(geminiModel, base64);
   if (!rawContent) throw new Error('Empty response from Gemini API');
 
   logger.debug('Gemini raw output', { content: rawContent });
 
-  // Strip markdown fences in case Gemini wraps output in ```json ... ```
   const cleaned = rawContent
     .replace(/^```(?:json)?\s*/i, '')
     .replace(/\s*```$/i, '')
