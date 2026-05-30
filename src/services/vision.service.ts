@@ -53,6 +53,7 @@ function validate(raw: unknown): ExtractedReceipt {
 async function callGeminiWithRetry(
   geminiModel: ReturnType<GoogleGenerativeAI['getGenerativeModel']>,
   base64: string,
+  prompt: string,
   maxRetries = 3
 ): Promise<string> {
   const delays = [10_000, 30_000, 60_000]; // 10s, 30s, 60s
@@ -61,7 +62,7 @@ async function callGeminiWithRetry(
     try {
       const result = await geminiModel.generateContent([
         { inlineData: { data: base64, mimeType: 'image/jpeg' } },
-        RECEIPT_SYSTEM_PROMPT + '\n\nกรุณาดึงข้อมูลจากเอกสารนี้',
+        prompt,
       ]);
       return result.response.text();
     } catch (err: unknown) {
@@ -94,7 +95,24 @@ export async function extractReceiptData(imageBuffer: Buffer): Promise<Extracted
     },
   });
 
-  const rawContent = await callGeminiWithRetry(geminiModel, base64);
+  // Inject company account names so the model can detect รายรับ vs รายจ่าย
+  // by checking whether OUR company is the RECIPIENT (income) or SENDER (expense)
+  const companyNames = (process.env.COMPANY_ACCOUNT_NAMES ?? '')
+    .split(',').map(s => s.trim()).filter(Boolean);
+
+  let companyContext = '';
+  if (companyNames.length) {
+    companyContext = `\n\n========== ข้อมูลบริษัทของเรา (สำคัญมากต่อ transaction_type) ==========
+ชื่อบัญชี/บริษัทของเรา: ${companyNames.join(', ')}
+กฎการแยก transaction_type:
+- ถ้า "ผู้รับเงิน/ปลายทาง/ไปยัง/บัญชีปลายทาง" ตรงหรือใกล้เคียงกับชื่อบริษัทเรา → "รายรับ" (ลูกค้าโอนค่าทัวร์เข้าบริษัท)
+- ถ้า "ผู้โอน/ต้นทาง/จาก" ตรงกับชื่อบริษัทเรา → "รายจ่าย" (บริษัทจ่ายเงินออก)
+- ใบเสร็จ/ใบกำกับภาษีที่บริษัทเราเป็นผู้ซื้อ → "รายจ่าย"
+====================================================================`;
+  }
+
+  const fullPrompt = RECEIPT_SYSTEM_PROMPT + companyContext + '\n\nกรุณาดึงข้อมูลจากเอกสารนี้';
+  const rawContent = await callGeminiWithRetry(geminiModel, base64, fullPrompt);
   if (!rawContent) throw new Error('Empty response from Gemini API');
 
   logger.debug('Gemini raw output', { content: rawContent });
