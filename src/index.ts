@@ -37,7 +37,8 @@ app.listen(PORT, async () => {
     await ensureHeaderRow();
     logger.info('Google Sheets header row verified');
   } catch (err) {
-    logger.warn('Google Sheets not configured yet — skipping header check');
-    logger.debug('Sheets init error', err);
+    // FIX: log actual error so we can diagnose token/permission issues from logs
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn(`Google Sheets init failed — ${msg}`);
   }
 });

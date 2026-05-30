@@ -29,11 +29,29 @@ setInterval(() => {
 // ─── Signature Verification ────────────────────────────────────────────────────
 
 function verifySignature(rawBody: string, signature: string): boolean {
+  const secret = process.env.LINE_CHANNEL_SECRET;
+  if (!secret) throw new Error('LINE_CHANNEL_SECRET is not set');
   const expected = crypto
-    .createHmac('sha256', process.env.LINE_CHANNEL_SECRET!)
+    .createHmac('sha256', secret)
     .update(rawBody)
     .digest('base64');
   return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+}
+
+// ─── Validation helpers ────────────────────────────────────────────────────────
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function sanitizeDate(raw: string): string {
+  if (DATE_RE.test(raw)) return raw;
+  // Try to parse partial dates like "22/05/2025" → "2025-05-22"
+  const parts = raw.split(/[\/\-\.]/);
+  if (parts.length === 3) {
+    const [a, b, c] = parts;
+    if (c && c.length === 4) return `${c}-${b.padStart(2, '0')}-${a.padStart(2, '0')}`;
+    if (a && a.length === 4) return `${a}-${b.padStart(2, '0')}-${c.padStart(2, '0')}`;
+  }
+  return raw; // pass through, let Sheets handle it
 }
 
 // ─── Event Handlers ────────────────────────────────────────────────────────────
@@ -42,8 +60,14 @@ async function handleImageMessage(event: WebhookEvent): Promise<void> {
   if (event.type !== 'message' || event.message.type !== 'image') return;
 
   const messageId = event.message.id;
-  const userId = event.source.userId ?? 'unknown';
+  const userId = event.source.userId;
   const { replyToken } = event;
+
+  // FIX: reject anonymous messages (no userId)
+  if (!userId) {
+    logger.warn('Image message with no userId — ignoring', { messageId });
+    return;
+  }
 
   logger.info('Image message received', { messageId, userId });
 
@@ -77,12 +101,23 @@ async function handleImageMessage(event: WebhookEvent): Promise<void> {
     return;
   }
 
+  // FIX: validate amount > 0
+  if (!receipt.total_amount || receipt.total_amount <= 0) {
+    logger.warn('Invalid amount from Vision API', { amount: receipt.total_amount });
+    await replyText(replyToken, 'ไม่สามารถอ่านยอดเงินได้ กรุณาลองใหม่').catch(() => {});
+    return;
+  }
+
+  // FIX: sanitize date format
+  const sanitizedDate = sanitizeDate(receipt.date || '');
+
   const costCenters = getCostCenters();
 
-  // Auto-save if only 1 cost center configured
+  // FIX: auto-save only when exactly 1 cost center (configured via COST_CENTERS env var)
+  // Default has 6 options so will always show picker — this is the intended behavior
   if (costCenters.length === 1) {
     const row: SheetRow = {
-      date: receipt.date,
+      date: sanitizedDate,
       merchant_name: receipt.merchant_name,
       total_amount: receipt.total_amount,
       category: receipt.category,
@@ -107,14 +142,14 @@ async function handleImageMessage(event: WebhookEvent): Promise<void> {
         `   หมวด       : ${receipt.category}`,
         `   Cost Center: ${costCenters[0]}`,
       ].join('\n')
-    ).catch((err) => logger.warn('Reply failed', { err }));
+    ).catch((err) => logger.warn('Reply failed (token may have expired)', { err }));
     return;
   }
 
   // Multiple cost centers → ask user to pick
   const pendingKey = `${userId}:${messageId}`;
   pendingReceipts.set(pendingKey, {
-    receipt,
+    receipt: { ...receipt, date: sanitizedDate },
     imageMessageId: messageId,
     createdAt: Date.now(),
   });
@@ -132,13 +167,22 @@ async function handleImageMessage(event: WebhookEvent): Promise<void> {
 async function handlePostback(event: WebhookEvent): Promise<void> {
   if (event.type !== 'postback') return;
 
-  const userId = event.source.userId ?? 'unknown';
-  const params = new URLSearchParams(event.postback.data);
+  const userId = event.source.userId;
+  if (!userId) return; // FIX: reject anonymous postbacks
 
+  const params = new URLSearchParams(event.postback.data);
   if (params.get('action') !== 'select_cost_center') return;
 
   const costCenter = decodeURIComponent(params.get('center') ?? '');
   const messageId = params.get('msgId') ?? '';
+
+  // FIX: validate costCenter against allowed list to prevent injection
+  const allowedCenters = getCostCenters();
+  if (!allowedCenters.includes(costCenter)) {
+    logger.warn('Invalid cost center in postback', { costCenter, userId });
+    await replyText(event.replyToken, 'ข้อมูลไม่ถูกต้อง กรุณาลองใหม่');
+    return;
+  }
 
   const specificKey = `${userId}:${messageId}`;
   let pendingKey = pendingReceipts.has(specificKey) ? specificKey : undefined;
@@ -155,7 +199,7 @@ async function handlePostback(event: WebhookEvent): Promise<void> {
     await replyText(
       event.replyToken,
       'ไม่พบข้อมูลใบเสร็จที่รอดำเนินการ\nกรุณาส่งภาพใบเสร็จอีกครั้ง'
-    );
+    ).catch(() => {});
     return;
   }
 
@@ -176,7 +220,7 @@ async function handlePostback(event: WebhookEvent): Promise<void> {
     await appendReceiptRow(row);
   } catch (err) {
     logger.error('Failed to write to Sheets (postback)', { err });
-    await replyText(event.replyToken, 'บันทึก Sheet ไม่สำเร็จ กรุณาลองใหม่');
+    await replyText(event.replyToken, 'บันทึก Sheet ไม่สำเร็จ กรุณาลองใหม่').catch(() => {});
     return;
   }
 
@@ -185,7 +229,7 @@ async function handlePostback(event: WebhookEvent): Promise<void> {
     amount: receipt.total_amount,
     category: receipt.category,
     costCenter,
-  });
+  }).catch((err) => logger.warn('Push confirmation failed', { err }));
 }
 
 // ─── Webhook Route ─────────────────────────────────────────────────────────────
@@ -197,17 +241,24 @@ router.post('/', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'Missing X-Line-Signature header' });
   }
 
-  const rawBody: string = (req as Request & { rawBody?: string }).rawBody ?? JSON.stringify(req.body);
+  // FIX: require rawBody — if missing, fail immediately rather than signing wrong content
+  const rawBody = (req as Request & { rawBody?: string }).rawBody;
+  if (!rawBody) {
+    logger.error('rawBody missing — request body middleware may be misconfigured');
+    return res.status(400).json({ error: 'Cannot verify signature' });
+  }
 
   try {
     if (!verifySignature(rawBody, signature)) {
       logger.warn('LINE signature verification failed');
       return res.status(403).json({ error: 'Invalid signature' });
     }
-  } catch {
+  } catch (err) {
+    logger.error('Signature check threw', { err });
     return res.status(403).json({ error: 'Invalid signature' });
   }
 
+  // Respond 200 immediately — LINE requires response within 30s
   res.status(200).json({ status: 'ok' });
 
   const { events = [] } = req.body as WebhookRequestBody;
@@ -220,7 +271,7 @@ router.post('/', async (req: Request, res: Response) => {
         await handlePostback(event);
       }
     } catch (err) {
-      logger.error(`Error handling ${event.type} event`, err);
+      logger.error(`Unhandled error in ${event.type} handler`, err);
     }
   }
 });

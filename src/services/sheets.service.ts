@@ -63,13 +63,17 @@ function getConfig(): { spreadsheetId: string; sheetName: string } {
   return { spreadsheetId, sheetName: process.env.GOOGLE_SHEET_NAME ?? 'Expenses' };
 }
 
+// FIX: cache sheets client — avoids refreshing token on every request
+let _sheetsClient: ReturnType<typeof google.sheets> | null = null;
+
 async function getSheetsClient() {
+  if (_sheetsClient) return _sheetsClient;
   const auth = getAuth();
-  // UserRefreshClient ใช้โดยตรงได้เลย, GoogleAuth ต้อง getClient() ก่อน
   const authClient = auth instanceof UserRefreshClient
     ? auth
     : await (auth as GoogleAuth).getClient();
-  return google.sheets({ version: 'v4', auth: authClient as unknown as Parameters<typeof google.sheets>[0]['auth'] });
+  _sheetsClient = google.sheets({ version: 'v4', auth: authClient as unknown as Parameters<typeof google.sheets>[0]['auth'] });
+  return _sheetsClient;
 }
 
 // ─── Public API ────────────────────────────────────────────────────────────────
