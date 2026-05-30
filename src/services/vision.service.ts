@@ -82,7 +82,7 @@ async function callGeminiWithRetry(
 
 export async function extractReceiptData(imageBuffer: Buffer): Promise<ExtractedReceipt> {
   const base64 = imageBuffer.toString('base64');
-  const modelName = process.env.GEMINI_MODEL ?? 'gemini-2.0-flash';
+  const modelName = process.env.GEMINI_MODEL ?? 'gemini-2.5-flash';
 
   logger.info('Calling Gemini Vision API', { model: modelName, imageSizeKB: Math.round(imageBuffer.length / 1024) });
 
