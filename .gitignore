@@ -6,3 +6,8 @@ credentials/
 .DS_Store
 tunnel_url.txt
 client_secret*.json
+# Receipt images — never commit customer slip data
+Bill/
+*.jpg
+*.jpeg
+*.png
