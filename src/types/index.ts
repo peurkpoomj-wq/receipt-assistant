@@ -1,8 +1,11 @@
+export type TransactionType = 'รายรับ' | 'รายจ่าย';
+
 export interface ExtractedReceipt {
   date: string;
   merchant_name: string;
   total_amount: number;
   category: 'อาหารและเครื่องดื่ม' | 'อุปกรณ์สำนักงาน' | 'เดินทางและที่พัก' | 'จิปาถะ';
+  transaction_type: TransactionType;
   error?: string;
 }
 
@@ -27,7 +30,26 @@ export interface SheetRow {
   merchant_name: string;
   total_amount: number;
   category: string;
+  transaction_type: TransactionType;
   cost_center: string;
   line_message_id: string;
   recorded_at: string;
+}
+
+// ─── Report types ──────────────────────────────────────────────────────────────
+
+export interface GroupSummary {
+  name: string;
+  income: number;
+  expense: number;
+  net: number;
+  count: number;
+}
+
+export interface MonthlyReport {
+  month: string;          // e.g. "2568-05"
+  totalIncome: number;
+  totalExpense: number;
+  net: number;
+  groups: GroupSummary[];
 }

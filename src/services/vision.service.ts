@@ -15,6 +15,7 @@ const VALID_CATEGORIES: ExtractedReceipt['category'][] = [
   'เดินทางและที่พัก',
   'จิปาถะ',
 ];
+const VALID_TYPES: ExtractedReceipt['transaction_type'][] = ['รายรับ', 'รายจ่าย'];
 
 function validate(raw: unknown): ExtractedReceipt {
   if (typeof raw !== 'object' || raw === null) {
@@ -34,11 +35,17 @@ function validate(raw: unknown): ExtractedReceipt {
     throw new Error(`Invalid category: "${obj.category}"`);
   }
 
+  // transaction_type — default to รายจ่าย if missing/invalid (backwards compat)
+  const txType = VALID_TYPES.includes(obj.transaction_type as ExtractedReceipt['transaction_type'])
+    ? (obj.transaction_type as ExtractedReceipt['transaction_type'])
+    : 'รายจ่าย';
+
   return {
     date: obj.date,
     merchant_name: obj.merchant_name,
     total_amount: obj.total_amount,
     category: obj.category as ExtractedReceipt['category'],
+    transaction_type: txType,
   };
 }
 

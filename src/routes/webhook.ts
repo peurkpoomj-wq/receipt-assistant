@@ -6,11 +6,12 @@ import {
   downloadLineImage,
   replyText,
   replyFlexCostCenterSelector,
+  replyDashboard,
   pushConfirmation,
   getCostCenters,
 } from '../services/line.service';
 import { extractReceiptData } from '../services/vision.service';
-import { appendReceiptRow } from '../services/sheets.service';
+import { appendReceiptRow, getMonthlyReport } from '../services/sheets.service';
 import { logger } from '../utils/logger';
 
 const router = Router();
@@ -121,6 +122,7 @@ async function handleImageMessage(event: WebhookEvent): Promise<void> {
       merchant_name: receipt.merchant_name,
       total_amount: receipt.total_amount,
       category: receipt.category,
+      transaction_type: receipt.transaction_type,
       cost_center: costCenters[0],
       line_message_id: messageId,
       recorded_at: new Date().toISOString(),
@@ -211,6 +213,7 @@ async function handlePostback(event: WebhookEvent): Promise<void> {
     merchant_name: receipt.merchant_name,
     total_amount: receipt.total_amount,
     category: receipt.category,
+    transaction_type: receipt.transaction_type,
     cost_center: costCenter,
     line_message_id: imageMessageId,
     recorded_at: new Date().toISOString(),
@@ -229,7 +232,46 @@ async function handlePostback(event: WebhookEvent): Promise<void> {
     amount: receipt.total_amount,
     category: receipt.category,
     costCenter,
+    transactionType: receipt.transaction_type,
   }).catch((err) => logger.warn('Push confirmation failed', { err }));
+}
+
+// ─── Text Command Handler ──────────────────────────────────────────────────────
+
+async function handleTextMessage(event: WebhookEvent): Promise<void> {
+  if (event.type !== 'message' || event.message.type !== 'text') return;
+
+  const text = event.message.text.trim();
+  const { replyToken } = event;
+
+  // "รายงาน" หรือ "รายงาน 2025-05" หรือ "report"
+  const reportMatch = text.match(/^(รายงาน|report|dashboard)(\s+(\d{4}-\d{2}))?$/i);
+  if (reportMatch) {
+    const yearMonth = reportMatch[3]; // optional YYYY-MM override
+    try {
+      const report = await getMonthlyReport(yearMonth);
+      await replyDashboard(replyToken, report);
+    } catch (err) {
+      logger.error('Failed to generate report', { err });
+      await replyText(replyToken, 'ไม่สามารถดึงรายงานได้ กรุณาลองใหม่อีกครั้ง').catch(() => {});
+    }
+    return;
+  }
+
+  // "ช่วย" หรือ "help" — show available commands
+  if (/^(ช่วย|help|\?)$/i.test(text)) {
+    await replyText(
+      replyToken,
+      [
+        '📖 คำสั่งที่ใช้ได้:',
+        '─────────────────────',
+        '📸 ส่งภาพสลิป/ใบเสร็จ → บันทึกอัตโนมัติ',
+        '📊 พิมพ์ "รายงาน" → ดูสรุปเดือนนี้',
+        '📅 พิมพ์ "รายงาน 2025-05" → ดูเดือนที่ระบุ',
+      ].join('\n')
+    ).catch(() => {});
+    return;
+  }
 }
 
 // ─── Webhook Route ─────────────────────────────────────────────────────────────
@@ -267,6 +309,8 @@ router.post('/', async (req: Request, res: Response) => {
     try {
       if (event.type === 'message' && event.message.type === 'image') {
         await handleImageMessage(event);
+      } else if (event.type === 'message' && event.message.type === 'text') {
+        await handleTextMessage(event);
       } else if (event.type === 'postback') {
         await handlePostback(event);
       }
