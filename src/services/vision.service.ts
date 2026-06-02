@@ -67,11 +67,14 @@ async function callGeminiWithRetry(
       return result.response.text();
     } catch (err: unknown) {
       const status = (err as { status?: number })?.status;
-      const isRateLimit = status === 429;
+      const msg = String((err as Error)?.message ?? '');
+      // Retry on transient errors: 429 rate limit, 503 overload, 500 internal
+      const isTransient = status === 429 || status === 503 || status === 500
+        || /429|503|500|overload|high demand|unavailable/i.test(msg);
 
-      if (isRateLimit && attempt < maxRetries) {
+      if (isTransient && attempt < maxRetries) {
         const delay = delays[attempt] ?? 60_000;
-        logger.warn(`Gemini rate limit (429) — retry ${attempt + 1}/${maxRetries} in ${delay / 1000}s`);
+        logger.warn(`Gemini transient error (${status ?? 'n/a'}) — retry ${attempt + 1}/${maxRetries} in ${delay / 1000}s`);
         await new Promise(r => setTimeout(r, delay));
         continue;
       }
